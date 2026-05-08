@@ -13,7 +13,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-RESULTS_CSV = "results/results.csv"
+RESULTS_CSV = "results/iqlearn_results.csv"
 FIGURES_DIR = "figures"
 os.makedirs(FIGURES_DIR, exist_ok=True)
 
@@ -31,8 +31,8 @@ plt.rcParams.update({
 
 ALGO_STYLE = {
     "iq_learn":    dict(color="#2563EB", marker="o",  linestyle="-",  label="IQ-Learn"),
-    "f_irl":       dict(color="#DC2626", marker="s",  linestyle="--", label="f-IRL"),
-    "soar_f_irl":  dict(color="#16A34A", marker="^",  linestyle="-.", label="SOAR + f-IRL"),
+    # "f_irl":       dict(color="#DC2626", marker="s",  linestyle="--", label="f-IRL"),
+    # "soar_f_irl":  dict(color="#16A34A", marker="^",  linestyle="-.", label="SOAR + f-IRL"),
 }
 
 
