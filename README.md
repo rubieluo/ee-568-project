@@ -1,4 +1,4 @@
-# RL Project 3 - Imitation Learning
+# Applied Project 3 Imitation Learning
 
 Comparing IQ-Learn, f-IRL, and SOAR+f-IRL on CartPole and Pendulum with different amounts of expert data (K = 1, 5, 20, 100 trajectories).
 
