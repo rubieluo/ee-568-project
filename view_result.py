@@ -2,7 +2,7 @@ import numpy as np
 import gymnasium as gym
 from stable_baselines3 import PPO, SAC
 
-# Watch the expert play live
+# watch expert
 # env = gym.make("CartPole-v1", render_mode="human")
 # model = PPO.load("experts/CartPole-v1_expert")
 

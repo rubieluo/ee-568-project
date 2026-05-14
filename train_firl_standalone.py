@@ -1,32 +1,12 @@
-"""
-train_firl_standalone.py
-
-f-IRL implementation for CartPole-v1 (discrete) and Pendulum-v1 (continuous).
-Uses MLPReward and SMMIRLDisc directly from the f-IRL repo.
-Builds everything else from scratch to avoid their MuJoCo/yaml dependencies.
-
-How f-IRL works:
-    outer loop:
-        1. Run SAC policy in environment, collect agent states
-        2. Train discriminator: expert states → 1, agent states → 0
-           discriminator output = log(p_expert(s) / p_agent(s)) = density ratio
-        3. Update reward function using density ratio
-        4. Repeat until agent state distribution matches expert
-
-Usage:
-    python train_firl_standalone.py --env CartPole-v1 --K 20 --seed 0
-    python train_firl_standalone.py --env Pendulum-v1 --K 100 --seed 1
-    python train_firl_standalone.py --env CartPole-v1 --all
-
-Results saved to: results/firl_results.csv
-"""
+# f-IRL for CartPole and Pendulum
+# based on: https://arxiv.org/abs/2011.04709
+# uses discriminator from f-IRL repo, everything else written from scratch
 
 import argparse
 import csv
 import os
 import sys
 import random
-import types
 from datetime import datetime
 
 import numpy as np
@@ -37,85 +17,76 @@ from torch.optim import Adam
 from torch.distributions import Categorical, Normal
 import gymnasium as gym
 
-# Pull reward model and discriminator from f-IRL repo
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "f-IRL"))
-from firl.models.reward import MLPReward
 from firl.models.discrim import SMMIRLDisc as Discriminator
 
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 RESULTS_CSV = os.path.join(RESULTS_DIR, "firl_results.csv")
 
-# Hyperparameters
+# hyperparams
 CONFIG = {
     "CartPole-v1": {
-        # SAC / policy
         "train_steps": 40_000,
         "batch_size": 256,
         "lr": 3e-4,
         "gamma": 0.99,
-        "eval_every": 5_000,
         "eval_eps": 20,
         "hidden": 256,
         "discrete": True,
         "alpha": 0.1,
-        # f-IRL specific
-        "disc_iter": 20, # how many steps to train discriminator each outer iter
-        "reward_iter": 50, # how many steps to update reward each outer iter
-        "reward_lr": 3e-4,
-        "outer_iters": 40, # number of outer loops
-        "collect_trajs": 10, # trajectories to collect per outer iter
+        "disc_iter": 20,
+        "outer_iters": 40,
+        "collect_trajs": 10,
     },
     "Pendulum-v1": {
         "train_steps": 50_000,
         "batch_size": 256,
         "lr": 1e-4,
         "gamma": 0.99,
-        "eval_every": 5_000,
         "eval_eps": 20,
         "hidden": 256,
         "discrete": False,
         "alpha": 0.2,
-        # f-IRL specific
         "disc_iter": 20,
-        "reward_iter": 50,
-        "reward_lr": 1e-4,
         "outer_iters": 40,
         "collect_trajs": 10,
     },
 }
 
 
-# Networks (same as IQ-Learn)
-
+# Q network for discrete actions (cartpole)
+# input: state, output: Q value for each action
 class QNetDiscrete(nn.Module):
-    """Q(s) → Q-values for all actions. For CartPole."""
     def __init__(self, obs_dim, act_dim, hidden):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(obs_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, act_dim),
+            nn.Linear(hidden, act_dim)
         )
+
     def forward(self, obs):
         return self.net(obs)
 
 
+# Q network for continuous actions (pendulum)
+# takes state AND action as input since we cant enumerate all actions
 class QNetContinuous(nn.Module):
-    """Q(s, a) → scalar. For Pendulum."""
     def __init__(self, obs_dim, act_dim, hidden):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(obs_dim + act_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, 1),
+            nn.Linear(hidden, 1)
         )
+
     def forward(self, obs, action):
         return self.net(torch.cat([obs, action], dim=-1))
 
 
+# gaussian policy for pendulum - outputs a distribution over actions
 class PolicyContinuous(nn.Module):
-    """Gaussian policy for Pendulum."""
     def __init__(self, obs_dim, act_dim, hidden, act_limit):
         super().__init__()
         self.act_limit = act_limit
@@ -137,16 +108,16 @@ class PolicyContinuous(nn.Module):
             dist = Normal(mean, std)
             raw = dist.rsample()
             action = torch.tanh(raw) * self.act_limit
+            # tanh squashing correction for log prob
             log_prob = (dist.log_prob(raw)
                         - torch.log(1 - action.pow(2) / self.act_limit**2 + 1e-6)
                         ).sum(dim=-1, keepdim=True)
         return action, log_prob
 
+
+# SAC agent for cartpole
+# reward comes from discriminator density ratio, not from environment
 class FIRLAgentDiscrete:
-    """
-    SAC-style agent for CartPole.
-    Key difference from IQ-Learn: reward comes from reward_func, not from iq_loss.
-    """
     def __init__(self, obs_dim, act_dim, cfg, device):
         self.gamma = cfg["gamma"]
         self.device = device
@@ -159,7 +130,7 @@ class FIRLAgentDiscrete:
         self.optimizer = Adam(self.q_net.parameters(), lr=cfg["lr"])
 
     def getV(self, obs):
-        """Soft value V(s) = α·logsumexp(Q(s,·)/α)"""
+        # soft value function V(s) = alpha * logsumexp(Q/alpha)
         q = self.q_net(obs)
         return self.alpha * torch.logsumexp(q / self.alpha, dim=1, keepdim=True)
 
@@ -179,11 +150,7 @@ class FIRLAgentDiscrete:
         return dist.sample().item()
 
     def update(self, obs_b, action_b, reward_b, next_obs_b, done_b):
-        """
-        Standard soft Q-learning update using f-IRL reward.
-        This is different from IQ-Learn — we use explicit rewards from reward_func
-        instead of the IQ-Learn loss.
-        """
+        # bellman target using discriminator reward
         with torch.no_grad():
             next_v = self.get_targetV(next_obs_b)
             target_q = reward_b + self.gamma * (1 - done_b) * next_v
@@ -200,8 +167,8 @@ class FIRLAgentDiscrete:
         self.target_net.load_state_dict(self.q_net.state_dict())
 
 
+# SAC agent for pendulum (continuous actions)
 class FIRLAgentContinuous:
-    """SAC agent for Pendulum with f-IRL reward."""
     def __init__(self, obs_dim, act_dim, act_limit, cfg, device):
         self.gamma = cfg["gamma"]
         self.device = device
@@ -237,10 +204,7 @@ class FIRLAgentContinuous:
         return action.squeeze(0).cpu().numpy()
 
     def update(self, obs_b, action_b, reward_b, next_obs_b, done_b):
-        """
-        SAC update using f-IRL reward.
-        Two updates: Q-network (critic) and policy (actor).
-        """
+        # critic update
         with torch.no_grad():
             next_v = self.get_targetV(next_obs_b)
             target_q = reward_b + self.gamma * (1 - done_b) * next_v
@@ -252,6 +216,7 @@ class FIRLAgentContinuous:
         q_loss.backward()
         self.q_optimizer.step()
 
+        # actor update - maximize Q while staying entropic
         action_pi, log_prob = self.policy(obs_b)
         q_pi = self.q_net(obs_b, action_pi)
         pi_loss = (self.alpha * log_prob - q_pi).mean()
@@ -266,8 +231,6 @@ class FIRLAgentContinuous:
         self.target_net.load_state_dict(self.q_net.state_dict())
 
 
-# Replay buffer 
-
 class ReplayBuffer:
     def __init__(self, capacity):
         self.capacity = capacity
@@ -275,33 +238,18 @@ class ReplayBuffer:
         self.pos = 0
 
     def push(self, obs, action, reward, next_obs, done):
-        """Note: no is_expert flag needed — f-IRL doesn't mix expert/agent in buffer"""
         if len(self.buffer) < self.capacity:
             self.buffer.append(None)
         self.buffer[self.pos] = (obs, action, reward, next_obs, done)
         self.pos = (self.pos + 1) % self.capacity
 
-    def update_rewards(self, reward_func, device):
-        """
-        Re-label all stored transitions with the current reward function.
-        This is key to f-IRL — as the reward function improves, we update
-        all stored transitions so the agent trains on better reward signals.
-        """
-        if len(self.buffer) == 0:
-            return
-        obs_arr = np.array([t[0] for t in self.buffer if t is not None])
-        with torch.no_grad():
-            new_rewards = reward_func.get_scalar_reward(obs_arr)
-        for i, t in enumerate(self.buffer):
-            if t is not None:
-                obs, action, _, next_obs, done = t
-                self.buffer[i] = (obs, action, float(new_rewards[i]), next_obs, done)
-
     def sample(self, batch_size, device):
         batch = random.sample([t for t in self.buffer if t is not None], batch_size)
         obs, action, reward, next_obs, done = zip(*batch)
 
-        to_t = lambda x: torch.FloatTensor(np.array(x)).to(device)
+        def to_t(x):
+            return torch.FloatTensor(np.array(x)).to(device)
+
         obs = to_t(obs)
         next_obs = to_t(next_obs)
         action = to_t(action)
@@ -322,19 +270,15 @@ def load_expert_data(env_name, K):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Dataset not found: {path}")
     data = np.load(path)
-    print(f"  Loaded expert dataset: {len(data['obs'])} transitions from {K} trajectories")
+    print(f"loaded {len(data['obs'])} expert transitions (K={K})")
     return data
 
 
 def collect_agent_states(agent, env_name, n_trajs, discrete):
-    """
-    Roll out current policy and collect visited states.
-    These are used to train the discriminator.
-    Returns array of shape (n_trajs * T, obs_dim)
-    """
+    # roll out current policy and save visited states
+    # used to train discriminator each outer iteration
     env = gym.make(env_name)
     states = []
-
     for ep in range(n_trajs):
         obs, _ = env.reset(seed=ep)
         done = False
@@ -344,7 +288,6 @@ def collect_agent_states(agent, env_name, n_trajs, discrete):
             states.append(obs.copy())
             obs, _, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
-
     env.close()
     return np.array(states)
 
@@ -352,7 +295,6 @@ def collect_agent_states(agent, env_name, n_trajs, discrete):
 def evaluate_policy(agent, env_name, n_episodes, discrete):
     env = gym.make(env_name)
     returns = []
-
     for ep in range(n_episodes):
         obs, _ = env.reset(seed=ep)
         done = False
@@ -364,14 +306,14 @@ def evaluate_policy(agent, env_name, n_episodes, discrete):
             done = terminated or truncated
             ep_ret += r
         returns.append(ep_ret)
-
     env.close()
     return float(np.mean(returns))
 
+
 def train(env_name, K, seed, cfg):
-    print(f"\n{'='*60}")
+    print(f"\n{'='*55}")
     print(f"f-IRL | {env_name} | K={K} | seed={seed}")
-    print(f"{'='*60}")
+    print(f"{'='*55}")
 
     random.seed(seed)
     np.random.seed(seed)
@@ -391,133 +333,87 @@ def train(env_name, K, seed, cfg):
         act_limit = float(env.action_space.high[0])
         agent = FIRLAgentContinuous(obs_dim, act_dim, act_limit, cfg, device)
 
-    reward_func = MLPReward(
-        input_dim = obs_dim,
-        hidden_sizes = (cfg["hidden"], cfg["hidden"]),
-        hid_act = "tanh",
-        device = device,
-    ).to(device)
-    reward_optimizer = Adam(reward_func.parameters(), lr=cfg["reward_lr"])
-
-    # Build discriminator (SMMIRLDisc from f-IRL repo)
-    # This classifies expert states (→1) vs agent states (→0)
-    # Its output logits = log density ratio = reward signal
+    # discriminator from f-IRL repo
+    # classifies expert states as 1, agent states as 0
+    # output logits = log(p_expert / p_agent) = reward signal
     disc = Discriminator(
-        input_dim = obs_dim,
-        hid_dim = cfg["hidden"],
-        batch_size = cfg["batch_size"],
-        device = device,
+        input_dim=obs_dim,
+        hid_dim=cfg["hidden"],
+        batch_size=cfg["batch_size"],
+        device=device,
     )
 
-    # Load expert data 
     expert_data = load_expert_data(env_name, K)
-    expert_states = expert_data["obs"] # shape (N, obs_dim)
+    expert_states = expert_data["obs"]
 
-    # Replay buffer
-    replay = ReplayBuffer(capacity=100_000)
+    buf = ReplayBuffer(capacity=100_000)
 
-    # Pre-fill buffer with random transitions so SAC can start updating 
+    # fill buffer with random transitions before training starts
     obs, _ = env.reset(seed=seed)
-    for _ in range(cfg["batch_size"] * 2):
+    for _ in range(cfg["batch_size"]):
         action = env.action_space.sample()
         next_obs, _, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
-        replay.push(obs, action, 0.0, next_obs, float(done))
+        buf.push(obs, action, 0.0, next_obs, float(done))
         obs = next_obs if not done else env.reset(seed=seed)[0]
 
-    # Outer loop: alternate between SAC, discriminator, reward
     best_return = -float("inf")
     sac_step = 0
     steps_per_outer = cfg["train_steps"] // cfg["outer_iters"]
 
     for outer_itr in range(cfg["outer_iters"]):
-        print(f"\n--- Outer iter {outer_itr+1}/{cfg['outer_iters']} ---")
+        print(f"\n--- outer iter {outer_itr+1}/{cfg['outer_iters']} ---")
 
-        #Run SAC with current reward function
-        # Collect transitions, label them with current reward_func
+        # step 1: run SAC using current discriminator reward
         obs, _ = env.reset(seed=seed + outer_itr)
         for _ in range(steps_per_outer):
             action = agent.choose_action(obs)
             next_obs, _, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
 
-            # Get reward from reward_func
             with torch.no_grad():
-                obs_t = torch.FloatTensor(obs).unsqueeze(0).to(device)
-                reward = float(reward_func(obs_t).cpu().item())
+                reward = float(disc.log_density_ratio(np.array([obs])).cpu().item())
 
-            replay.push(obs, action, reward, next_obs, float(done))
+            buf.push(obs, action, reward, next_obs, float(done))
             obs = next_obs if not done else env.reset(seed=seed + sac_step)[0]
             sac_step += 1
 
-            # SAC update
-            if len(replay) >= cfg["batch_size"]:
-                obs_b, next_obs_b, action_b, reward_b, done_b = replay.sample(
+            if len(buf) >= cfg["batch_size"]:
+                obs_b, next_obs_b, action_b, reward_b, done_b = buf.sample(
                     cfg["batch_size"], device)
                 agent.update(obs_b, action_b, reward_b, next_obs_b, done_b)
 
             if sac_step % 1000 == 0:
                 agent.update_target()
 
-        # Collect agent states for discriminator training
-        # We need to know which states the agent is currently visiting
-        agent_states = collect_agent_states(
-            agent, env_name, cfg["collect_trajs"], discrete)
-        print(f"  Collected {len(agent_states)} agent states")
+        # step 2: update discriminator with fresh agent states
+        agent_states = collect_agent_states(agent, env_name, cfg["collect_trajs"], discrete)
+        print(f"  collected {len(agent_states)} agent states")
 
-        # Train discriminator
-        # expert states → 1, agent states → 0
-        # after training: disc output = log(p_expert / p_agent)
-        disc_loss = disc.learn(
-            expert_states,
-            agent_states,
-            iter=cfg["disc_iter"],
-        )
-        print(f"  Disc loss: {np.mean(disc_loss[-10:]):.4f}")
+        disc_loss = disc.learn(expert_states, agent_states, iter=cfg["disc_iter"])
+        print(f"  disc loss: {np.mean(disc_loss[-10:]):.4f}")
 
-        # Update reward function
-        # The reward function is updated to match the discriminator's density ratio
-        # This is the core f-IRL update:
-        # reward(s) should approximate log(p_expert(s) / p_agent(s))
-        reward_losses = []
-        for _ in range(cfg["reward_iter"]):
-            # Sample states from agent trajectories
-            idx = np.random.choice(len(agent_states), cfg["batch_size"])
-            s_batch = torch.FloatTensor(agent_states[idx]).to(device)
+        # step 3: re-label buffer with updated discriminator
+        obs_arr = np.array([t[0] for t in buf.buffer if t is not None])
+        with torch.no_grad():
+            new_rewards = disc.log_density_ratio(obs_arr).cpu().numpy()
+        idx = 0
+        for i, t in enumerate(buf.buffer):
+            if t is not None:
+                o, a, _, no, d = t
+                buf.buffer[i] = (o, a, float(new_rewards[idx]), no, d)
+                idx += 1
 
-            # Get density ratio from discriminator
-            with torch.no_grad():
-                log_ratio = disc.log_density_ratio(agent_states[idx])
-
-            # Reward should predict the log density ratio
-            # r(s) ≈ log(p_expert(s) / p_agent(s))
-            pred_reward = reward_func(s_batch).squeeze()
-            reward_loss = F.mse_loss(pred_reward, log_ratio)
-
-            reward_optimizer.zero_grad()
-            reward_loss.backward()
-            reward_optimizer.step()
-            reward_losses.append(reward_loss.item())
-
-        print(f"  Reward loss: {np.mean(reward_losses):.4f}")
-
-        # Re-label replay buffer with updated reward
-        # Now that reward_func has improved, update all stored transitions
-        replay.update_rewards(reward_func, device)
-
-        # Evaluate
         mean_ret = evaluate_policy(agent, env_name, cfg["eval_eps"], discrete)
         if mean_ret > best_return:
             best_return = mean_ret
-        print(f"  eval_return={mean_ret:.1f} | best={best_return:.1f}")
+        print(f"  eval={mean_ret:.1f} | best={best_return:.1f}")
 
     env.close()
-
     final_return = evaluate_policy(agent, env_name, cfg["eval_eps"], discrete)
-    print(f"\nFinal return: {final_return:.1f}")
+    print(f"\nfinal return: {final_return:.1f}")
     return final_return, best_return
 
-# Main
 
 def main():
     parser = argparse.ArgumentParser()
@@ -525,8 +421,7 @@ def main():
                         choices=["CartPole-v1", "Pendulum-v1"])
     parser.add_argument("--K", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--all", action="store_true",
-                        help="Run full sweep: all K values x 3 seeds")
+    parser.add_argument("--all", action="store_true")
     args = parser.parse_args()
 
     runs = (
@@ -535,7 +430,7 @@ def main():
         [(args.env, args.K, args.seed)]
     )
 
-    print(f"Planned runs: {len(runs)}")
+    print(f"planned runs: {len(runs)}")
 
     fieldnames = ["env", "algo", "K", "seed", "mean_return", "best_return", "timestamp"]
     write_header = not os.path.exists(RESULTS_CSV)
@@ -556,7 +451,7 @@ def main():
             ))
             f.flush()
 
-    print(f"\nAll results saved to {RESULTS_CSV}")
+    print(f"\nresults saved to {RESULTS_CSV}")
 
 
 if __name__ == "__main__":

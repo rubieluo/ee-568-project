@@ -1,16 +1,6 @@
-"""
-train_iqlearn_standalone.py
-
-Clean IQ-Learn implementation for CartPole-v1 (discrete) and Pendulum-v1 (continuous).
-Uses iq_loss() directly from the IQ-Learn repo, builds everything else from scratch
-to avoid their broken hydra/wandb/old-gym dependencies.
-
-Usage:
-    python train_iqlearn_standalone.py --env CartPole-v1 --K 20 --seed 0
-    python train_iqlearn_standalone.py --env Pendulum-v1 --K 100 --seed 1
-
-Results saved to: results/iqlearn_results.csv
-"""
+# IQ-Learn for CartPole and Pendulum
+# based on: https://arxiv.org/abs/2106.12142
+# uses iq_loss from the IQ-Learn repo, everything else written from scratch
 
 import argparse
 import csv
@@ -28,7 +18,6 @@ from torch.optim import Adam
 from torch.distributions import Categorical, Normal
 import gymnasium as gym
 
-# Pull iq_loss from the repo without importing anything else
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "IQ-Learn", "iq_learn"))
 from iq import iq_loss
 
@@ -36,7 +25,6 @@ RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 RESULTS_CSV = os.path.join(RESULTS_DIR, "iqlearn_results.csv")
 
-# Hyperparameters
 CONFIG = {
     "CartPole-v1": {
         "train_steps": 40_000,
@@ -47,7 +35,7 @@ CONFIG = {
         "eval_eps": 20,
         "hidden": 256,
         "discrete": True,
-        "alpha": 0.1, 
+        "alpha": 0.1,
     },
     "Pendulum-v1": {
         "train_steps": 50_000,
@@ -63,38 +51,36 @@ CONFIG = {
 }
 
 
-# Networks
-
+# Q network for discrete actions (cartpole)
 class QNetDiscrete(nn.Module):
-    """Q(s, ·) → vector of Q-values, one per action. For CartPole."""
     def __init__(self, obs_dim, act_dim, hidden):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(obs_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, act_dim),
+            nn.Linear(hidden, act_dim)
         )
 
     def forward(self, obs):
         return self.net(obs)
 
 
+# Q network for continuous actions (pendulum)
 class QNetContinuous(nn.Module):
-    """Q(s, a) → scalar. For Pendulum."""
     def __init__(self, obs_dim, act_dim, hidden):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(obs_dim + act_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, 1),
+            nn.Linear(hidden, 1)
         )
 
     def forward(self, obs, action):
         return self.net(torch.cat([obs, action], dim=-1))
 
 
+# gaussian policy for pendulum
 class PolicyContinuous(nn.Module):
-    """Gaussian policy for Pendulum."""
     def __init__(self, obs_dim, act_dim, hidden, act_limit):
         super().__init__()
         self.act_limit = act_limit
@@ -116,19 +102,15 @@ class PolicyContinuous(nn.Module):
             dist = Normal(mean, std)
             raw = dist.rsample()
             action = torch.tanh(raw) * self.act_limit
-            # log prob with tanh squashing correction
+            # tanh squashing correction
             log_prob = (dist.log_prob(raw)
                         - torch.log(1 - action.pow(2) / self.act_limit**2 + 1e-6)
                         ).sum(dim=-1, keepdim=True)
         return action, log_prob
 
 
-# Agent wrappers that expose the interface iq_loss() expects:
-# agent.gamma, agent.args, agent.getV(obs), agent.get_targetV(obs)
-
+# agent for cartpole - wraps QNetDiscrete to match iq_loss interface
 class IQAgentDiscrete:
-    """Wraps QNetDiscrete to match the interface expected by iq_loss()."""
-
     def __init__(self, obs_dim, act_dim, cfg, device):
         self.gamma = cfg["gamma"]
         self.device = device
@@ -140,14 +122,14 @@ class IQAgentDiscrete:
         self.target_net.load_state_dict(self.q_net.state_dict())
         self.optimizer = Adam(self.q_net.parameters(), lr=cfg["lr"])
 
-        # args namespace that iq_loss() reads
+        # iq_loss reads these from agent.args
         self.args = types.SimpleNamespace(
             gamma=self.gamma,
             method=types.SimpleNamespace(
-                div="chi", # χ² divergence (phi_grad=1, adds chi2_loss term)
-                loss="value", # use both expert + agent states
-                chi=True, # enable χ² regularization term
-                alpha=0.5, # χ² coefficient
+                div="chi",
+                loss="value",
+                chi=True,
+                alpha=0.5,
                 grad_pen=False,
                 regularize=False,
                 tanh=False,
@@ -156,7 +138,6 @@ class IQAgentDiscrete:
         )
 
     def getV(self, obs):
-        """Soft value function V(s) = α · logsumexp(Q(s,·) / α)"""
         q = self.q_net(obs)
         return self.alpha * torch.logsumexp(q / self.alpha, dim=1, keepdim=True)
 
@@ -165,7 +146,6 @@ class IQAgentDiscrete:
         return self.alpha * torch.logsumexp(q / self.alpha, dim=1, keepdim=True)
 
     def critic(self, obs, action):
-        """Q(s, a) for a specific action index."""
         q = self.q_net(obs)
         return q.gather(1, action.long())
 
@@ -180,9 +160,8 @@ class IQAgentDiscrete:
         self.target_net.load_state_dict(self.q_net.state_dict())
 
 
+# agent for pendulum
 class IQAgentContinuous:
-    """Wraps QNetContinuous + PolicyContinuous for Pendulum."""
-
     def __init__(self, obs_dim, act_dim, act_limit, cfg, device):
         self.gamma = cfg["gamma"]
         self.device = device
@@ -211,17 +190,16 @@ class IQAgentContinuous:
             )
         )
 
-    def _value_from_q(self, obs, net):
+    def _val(self, obs, net):
         action, log_prob = self.policy(obs)
-        q = net(obs, action)
-        return q - self.alpha * log_prob
+        return net(obs, action) - self.alpha * log_prob
 
     def getV(self, obs):
-        return self._value_from_q(obs, self.q_net)
+        return self._val(obs, self.q_net)
 
     def get_targetV(self, obs):
         with torch.no_grad():
-            return self._value_from_q(obs, self.target_net)
+            return self._val(obs, self.target_net)
 
     def critic(self, obs, action):
         return self.q_net(obs, action)
@@ -236,8 +214,6 @@ class IQAgentContinuous:
         self.target_net.load_state_dict(self.q_net.state_dict())
 
 
-# Replay buffer
-
 class ReplayBuffer:
     def __init__(self, capacity):
         self.capacity = capacity
@@ -251,10 +227,12 @@ class ReplayBuffer:
         self.pos = (self.pos + 1) % self.capacity
 
     def sample(self, batch_size, device):
-        batch = random.sample(self.buffer, batch_size)
+        batch = random.sample([t for t in self.buffer if t is not None], batch_size)
         obs, action, reward, next_obs, done, is_expert = zip(*batch)
 
-        to_t = lambda x: torch.FloatTensor(np.array(x)).to(device)
+        def to_t(x):
+            return torch.FloatTensor(np.array(x)).to(device)
+
         obs = to_t(obs)
         next_obs = to_t(next_obs)
         action = to_t(action)
@@ -268,29 +246,16 @@ class ReplayBuffer:
         return obs, next_obs, action, reward, done, is_expert
 
     def __len__(self):
-        return len(self.buffer)
+        return len([t for t in self.buffer if t is not None])
 
-
-# Training
 
 def load_expert_data(env_name, K):
     path = f"datasets/{env_name}_K{K}.npz"
     if not os.path.exists(path):
-        raise FileNotFoundError(f"Dataset not found: {path}\nRun collect_demos.py first.")
-    return np.load(path)
-
-
-def fill_expert_buffer(replay_buffer, expert_data, max_transitions=50_000):
-    """Load expert transitions into the replay buffer, flagged as is_expert=True."""
-    obs = expert_data["obs"]
-    actions = expert_data["actions"]
-    n_obs = expert_data["next_obs"]
-    dones = expert_data["dones"]
-    n = min(len(obs), max_transitions)
-
-    for i in range(n):
-        replay_buffer.push(obs[i], actions[i], 0.0, n_obs[i], dones[i], True)
-    print(f"  Loaded {n} expert transitions into buffer")
+        raise FileNotFoundError(f"Dataset not found: {path}")
+    data = np.load(path)
+    print(f"loaded {len(data['obs'])} expert transitions (K={K})")
+    return data
 
 
 def evaluate_policy(agent, env_name, n_episodes, discrete):
@@ -302,7 +267,7 @@ def evaluate_policy(agent, env_name, n_episodes, discrete):
         ep_ret = 0.0
         while not done:
             action = agent.choose_action(obs, deterministic=True) if not discrete \
-                       else agent.choose_action(obs)
+                     else agent.choose_action(obs)
             obs, r, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             ep_ret += r
@@ -312,11 +277,10 @@ def evaluate_policy(agent, env_name, n_episodes, discrete):
 
 
 def train(env_name, K, seed, cfg):
-    print(f"\n{'='*60}")
+    print(f"\n{'='*55}")
     print(f"IQ-Learn | {env_name} | K={K} | seed={seed}")
-    print(f"{'='*60}")
+    print(f"{'='*55}")
 
-    # Seeds
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -327,7 +291,6 @@ def train(env_name, K, seed, cfg):
     env = gym.make(env_name)
     obs_dim = env.observation_space.shape[0]
 
-    # Build agent
     if discrete:
         act_dim = env.action_space.n
         agent = IQAgentDiscrete(obs_dim, act_dim, cfg, device)
@@ -336,46 +299,43 @@ def train(env_name, K, seed, cfg):
         act_limit = float(env.action_space.high[0])
         agent = IQAgentContinuous(obs_dim, act_dim, act_limit, cfg, device)
 
-    # Replay buffer: expert + agent transitions together
-    replay = ReplayBuffer(capacity=100_000)
+    buf = ReplayBuffer(capacity=100_000)
 
-    # Fill with expert data
-    expert_data = load_expert_data(env_name, K)
-    fill_expert_buffer(replay, expert_data)
+    # load expert data into buffer, flagged as expert
+    data = load_expert_data(env_name, K)
+    n = min(len(data["obs"]), 50_000)
+    for i in range(n):
+        buf.push(data["obs"][i], data["actions"][i], 0.0,
+                 data["next_obs"][i], data["dones"][i], True)
+    print(f"  loaded {n} expert transitions")
 
-    # Training loop
     obs, _ = env.reset(seed=seed)
     best_return = -float("inf")
-    eval_returns = []
 
     for step in range(1, cfg["train_steps"] + 1):
-
-        # Collect one agent transition
+        # collect agent transition
         action = agent.choose_action(obs)
         next_obs, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
-        replay.push(obs, action, reward, next_obs, float(done), False)
+        buf.push(obs, action, reward, next_obs, float(done), False)
         obs = next_obs if not done else env.reset(seed=seed + step)[0]
 
-        # Need enough samples to form a mixed batch
-        if len(replay) < cfg["batch_size"] * 2:
+        if len(buf) < cfg["batch_size"] * 2:
             continue
 
         # IQ-Learn update
-        batch = replay.sample(cfg["batch_size"], device)
-        obs_b, next_obs_b, action_b, reward_b, done_b, is_expert_b = batch
+        obs_b, next_obs_b, action_b, reward_b, done_b, is_expert_b = buf.sample(
+            cfg["batch_size"], device)
 
         current_Q = agent.critic(obs_b, action_b)
         current_v = agent.getV(obs_b)
         next_v = agent.get_targetV(next_obs_b)
 
         loss, loss_dict = iq_loss(
-            agent,
-            current_Q, current_v, next_v,
+            agent, current_Q, current_v, next_v,
             (obs_b, next_obs_b, action_b, reward_b, done_b, is_expert_b)
         )
 
-        # Critic update
         if discrete:
             agent.optimizer.zero_grad()
             loss.backward()
@@ -385,7 +345,6 @@ def train(env_name, K, seed, cfg):
             loss.backward()
             agent.q_optimizer.step()
 
-            # Policy update (maximize Q)
             action_pi, log_prob = agent.policy(obs_b)
             q_pi = agent.q_net(obs_b, action_pi)
             pi_loss = (agent.alpha * log_prob - q_pi).mean()
@@ -393,28 +352,20 @@ def train(env_name, K, seed, cfg):
             pi_loss.backward()
             agent.pi_optimizer.step()
 
-        # Periodic target network update
         if step % 1000 == 0:
             agent.update_target()
 
-        # Evaluation
         if step % cfg["eval_every"] == 0:
             mean_ret = evaluate_policy(agent, env_name, cfg["eval_eps"], discrete)
-            eval_returns.append(mean_ret)
             if mean_ret > best_return:
                 best_return = mean_ret
-            print(f"  step {step:>6d}/{cfg['train_steps']} | "
-                  f"eval_return={mean_ret:.1f} | "
-                  f"best={best_return:.1f} | "
-                  f"loss={loss_dict['total_loss']:.4f}")
+            print(f"  step {step}/{cfg['train_steps']} | eval={mean_ret:.1f} | best={best_return:.1f} | loss={loss_dict['total_loss']:.4f}")
 
     env.close()
     final_return = evaluate_policy(agent, env_name, cfg["eval_eps"], discrete)
-    print(f"\nFinal return: {final_return:.1f}")
+    print(f"\nfinal return: {final_return:.1f}")
     return final_return
 
-
-# Main
 
 def main():
     parser = argparse.ArgumentParser()
@@ -422,8 +373,7 @@ def main():
                         choices=["CartPole-v1", "Pendulum-v1"])
     parser.add_argument("--K", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--all", action="store_true",
-                        help="Run full sweep: all K values x 3 seeds")
+    parser.add_argument("--all", action="store_true")
     args = parser.parse_args()
 
     runs = (
@@ -432,7 +382,7 @@ def main():
         [(args.env, args.K, args.seed)]
     )
 
-    print(f"Planned runs: {len(runs)}")
+    print(f"planned runs: {len(runs)}")
 
     fieldnames = ["env", "algo", "K", "seed", "mean_return", "timestamp"]
     write_header = not os.path.exists(RESULTS_CSV)
@@ -452,7 +402,7 @@ def main():
             ))
             f.flush()
 
-    print(f"\nAll results saved to {RESULTS_CSV}")
+    print(f"\nresults saved to {RESULTS_CSV}")
 
 
 if __name__ == "__main__":

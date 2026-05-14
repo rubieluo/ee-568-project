@@ -1,17 +1,3 @@
-"""
-Phase 2: Roll out trained expert and save K trajectories.
-Usage:
-    python collect_demos.py --env CartPole-v1 --K 100
-    python collect_demos.py --env Pendulum-v1 --K 100
-
-Saves: datasets/{env_name}_K{K}.npz
-  obs:      (N, obs_dim)
-  actions:  (N, act_dim) or (N,)
-  next_obs: (N, obs_dim)
-  dones:    (N,)
-  rewards:  (N,)
-"""
-
 import argparse
 import os
 import numpy as np

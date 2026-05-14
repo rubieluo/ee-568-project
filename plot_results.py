@@ -1,12 +1,3 @@
-"""
-plot_results.py — Generate all figures for the report.
-Usage:
-    python plot_results.py
-
-Reads:  results/all_results.csv
-Saves:  figures/
-"""
-
 import os
 import pandas as pd
 import numpy as np
