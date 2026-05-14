@@ -3,8 +3,8 @@ plot_results.py — Generate all figures for the report.
 Usage:
     python plot_results.py
 
-Reads:  results/results.csv
-Saves:  figures/  (one PDF per environment, plus a combined figure)
+Reads:  results/all_results.csv
+Saves:  figures/
 """
 
 import os
@@ -13,52 +13,52 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-RESULTS_CSV = "results/iqlearn_results.csv"
+RESULTS_CSV = "results/all_results.csv"
 FIGURES_DIR = "figures"
 os.makedirs(FIGURES_DIR, exist_ok=True)
 
-# ── Style ──────────────────────────────────────────────────────────────────
 plt.rcParams.update({
     "font.family": "serif",
-    "font.size": 11,
-    "axes.spines.top": False,
+    "font.size":   11,
+    "axes.spines.top":   False,
     "axes.spines.right": False,
-    "axes.grid": True,
-    "grid.alpha": 0.3,
+    "axes.grid":    True,
+    "grid.alpha":   0.3,
     "grid.linestyle": "--",
-    "figure.dpi": 150,
+    "figure.dpi":   150,
 })
 
 ALGO_STYLE = {
-    "iq_learn":    dict(color="#2563EB", marker="o",  linestyle="-",  label="IQ-Learn"),
-    # "f_irl":       dict(color="#DC2626", marker="s",  linestyle="--", label="f-IRL"),
-    # "soar_f_irl":  dict(color="#16A34A", marker="^",  linestyle="-.", label="SOAR + f-IRL"),
+    "iq_learn":   dict(color="#2563EB", marker="o", linestyle="-",  label="IQ-Learn"),
+    "f_irl":      dict(color="#DC2626", marker="s", linestyle="--", label="f-IRL"),
+    "soar_f_irl": dict(color="#16A34A", marker="^", linestyle="-.", label="SOAR+f-IRL"),
 }
 
 
-def load_results():
-    df = pd.read_csv(RESULTS_CSV)
-    # Aggregate over seeds
+def load_results(metric="mean_return"):
+    df  = pd.read_csv(RESULTS_CSV)
     agg = (
-        df.groupby(["env", "algo", "K"])["mean_return"]
+        df.groupby(["env", "algo", "K"])[metric]
         .agg(mean="mean", std="std", count="count")
         .reset_index()
     )
-    agg["se"] = agg["std"] / np.sqrt(agg["count"])  # standard error for shading
     return agg
 
 
-def plot_env(agg, env_name, ax, show_ylabel=True):
-    data = agg[agg["env"] == env_name]
+def plot_env(agg, env_name, ax, show_ylabel=True, title_suffix=""):
+    data   = agg[agg["env"] == env_name]
     K_vals = sorted(data["K"].unique())
 
     for algo, style in ALGO_STYLE.items():
         sub = data[data["algo"] == algo].sort_values("K")
         if sub.empty:
             continue
-        ax.plot(sub["K"], sub["mean"], label=style["label"],
-                color=style["color"], marker=style["marker"],
-                linestyle=style["linestyle"], linewidth=1.8, markersize=6)
+        ax.plot(sub["K"], sub["mean"],
+                label=style["label"],
+                color=style["color"],
+                marker=style["marker"],
+                linestyle=style["linestyle"],
+                linewidth=1.8, markersize=6)
         ax.fill_between(sub["K"],
                         sub["mean"] - sub["std"],
                         sub["mean"] + sub["std"],
@@ -70,60 +70,73 @@ def plot_env(agg, env_name, ax, show_ylabel=True):
     ax.set_xlabel("Expert trajectories K", fontsize=11)
     if show_ylabel:
         ax.set_ylabel("Mean episode return", fontsize=11)
-    ax.set_title(env_name, fontsize=12, fontweight="bold")
+    title = env_name
+    if title_suffix:
+        title += f" ({title_suffix})"
+    ax.set_title(title, fontsize=12, fontweight="bold")
     ax.legend(fontsize=9, framealpha=0.5)
 
 
-def make_combined_figure(agg):
-    """Single figure with one subplot per environment — for the report."""
-    envs = agg["env"].unique()
-    fig, axes = plt.subplots(1, len(envs), figsize=(5.5 * len(envs), 4), sharey=False)
-    if len(envs) == 1:
-        axes = [axes]
-
+def make_main_figure(metric="mean_return", suffix="", filename="combined_results"):
+    agg  = load_results(metric)
+    envs = ["CartPole-v1", "Pendulum-v1"]
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4), sharey=False)
     for i, (env, ax) in enumerate(zip(envs, axes)):
-        plot_env(agg, env, ax, show_ylabel=(i == 0))
-
-    fig.suptitle("IL algorithm comparison: mean return vs. expert dataset size\n"
-                 "(shaded region = ±1 std across 3 seeds)",
-                 fontsize=11, y=1.02)
+        plot_env(agg, env, ax, show_ylabel=(i == 0), title_suffix=suffix)
+    metric_label = "mean return" if metric == "mean_return" else "best return"
+    fig.suptitle(
+        f"IL algorithm comparison: {metric_label} vs. expert dataset size\n"
+        "(shaded region = ±1 std across 3 seeds)",
+        fontsize=11, y=1.02
+    )
     fig.tight_layout()
-    path = os.path.join(FIGURES_DIR, "combined_results.pdf")
-    fig.savefig(path, bbox_inches="tight")
-    print(f"Saved {path}")
-
-
-def make_per_env_figures(agg):
-    """One figure per environment — useful for poster / slides."""
-    for env in agg["env"].unique():
-        fig, ax = plt.subplots(figsize=(5, 3.8))
-        plot_env(agg, env, ax)
-        fig.tight_layout()
-        safe_name = env.replace("-", "_").replace("/", "_")
-        path = os.path.join(FIGURES_DIR, f"{safe_name}.pdf")
+    for ext in ["pdf", "png"]:
+        path = os.path.join(FIGURES_DIR, f"{filename}.{ext}")
         fig.savefig(path, bbox_inches="tight")
         print(f"Saved {path}")
+    plt.close(fig)
+
+
+def make_per_env_figures(metric="mean_return", suffix=""):
+    agg  = load_results(metric)
+    envs = ["CartPole-v1", "Pendulum-v1"]
+    for env in envs:
+        fig, ax = plt.subplots(figsize=(5, 3.8))
+        plot_env(agg, env, ax, title_suffix=suffix)
+        fig.tight_layout()
+        safe = env.replace("-", "_").replace("/", "_")
+        tag  = f"_{suffix.replace(' ', '_')}" if suffix else ""
+        for ext in ["pdf", "png"]:
+            path = os.path.join(FIGURES_DIR, f"{safe}{tag}.{ext}")
+            fig.savefig(path, bbox_inches="tight")
+            print(f"Saved {path}")
         plt.close(fig)
 
 
-def print_summary_table(agg):
-    """Print a LaTeX-ready results table."""
-    print("\n% LaTeX results table (paste into report)\n")
-    print(r"\begin{tabular}{lllcc}")
+def print_summary_table(metric="mean_return"):
+    agg = load_results(metric)
+    print(f"\n% LaTeX results table ({metric})\n")
+    print(r"\begin{tabular}{llrcc}")
     print(r"\toprule")
-    print(r"Environment & Algorithm & K & Mean return & Std \\")
+    print(r"Environment & Algorithm & $K$ & Mean & Std \\")
     print(r"\midrule")
-    for _, row in agg.iterrows():
-        algo_label = ALGO_STYLE[row["algo"]]["label"]
-        print(f"{row['env']} & {algo_label} & {int(row['K'])} & "
-              f"{row['mean']:.1f} & {row['std']:.1f} \\\\")
+    for env in ["CartPole-v1", "Pendulum-v1"]:
+        for algo, style in ALGO_STYLE.items():
+            sub = agg[(agg["env"] == env) & (agg["algo"] == algo)].sort_values("K")
+            for _, row in sub.iterrows():
+                print(f"{env} & {style['label']} & {int(row['K'])} & "
+                      f"{row['mean']:.1f} & {row['std']:.1f} \\\\")
+        print(r"\midrule")
     print(r"\bottomrule")
     print(r"\end{tabular}")
 
 
 if __name__ == "__main__":
-    agg = load_results()
-    make_combined_figure(agg)
-    make_per_env_figures(agg)
-    print_summary_table(agg)
+    make_main_figure(metric="mean_return", filename="combined_mean_return")
+    make_per_env_figures(metric="mean_return")
+    make_main_figure(metric="best_return", suffix="best return",
+                     filename="combined_best_return")
+    make_per_env_figures(metric="best_return", suffix="best return")
+    print_summary_table(metric="mean_return")
+    print_summary_table(metric="best_return")
     print("\nAll figures saved to figures/")
