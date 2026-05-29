@@ -1,7 +1,10 @@
 # SOAR + f-IRL for CartPole and Pendulum
 # based on IL-SOAR paper: https://arxiv.org/abs/2502.19859
-# only change from f-IRL: ensemble of L critics instead of 1
-# optimistic Q = mean(critics) - clip(std(critics), 0, sigma)
+# SOAR = ensemble of L critics + optimistic Q in actor only
+#   - reward-maximization framing => mean + clip(std, 0, sigma)
+#   - critic backup is plain SAC (no optimism bonus)
+#   - each of the L critics is itself a double-Q pair
+#   - each critic has its own replay buffer (independent samples)
 
 import argparse
 import csv
@@ -20,6 +23,7 @@ import gymnasium as gym
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "f-IRL"))
 from firl.models.discrim import SMMIRLDisc as Discriminator
+from firl.models.reward import MLPReward
 
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -35,11 +39,15 @@ CONFIG = {
         "hidden": 256,
         "discrete": True,
         "alpha": 0.1,
+        "tau": 0.005,
         "disc_iter": 20,
         "outer_iters": 40,
         "collect_trajs": 10,
-        "n_critics": 4,   # L from paper
-        "sigma": 1.0,     # std clipping threshold
+        "reward_grad_steps": 10,
+        "reward_lr": 3e-4,
+        "div": "fkl",
+        "n_critics": 4,
+        "sigma": 1.0,
     },
     "Pendulum-v1": {
         "train_steps": 50_000,
@@ -50,11 +58,15 @@ CONFIG = {
         "hidden": 256,
         "discrete": False,
         "alpha": 0.2,
+        "tau": 0.005,
         "disc_iter": 20,
         "outer_iters": 40,
         "collect_trajs": 10,
+        "reward_grad_steps": 10,
+        "reward_lr": 3e-4,
+        "div": "fkl",
         "n_critics": 4,
-        "sigma": 1.0,
+        "sigma": 10.0,  # paper grid-searches sigma per env; larger for continuous control
     },
 }
 
@@ -113,69 +125,114 @@ class PolicyContinuous(nn.Module):
         return action, log_prob
 
 
-# algorithm 5 from the paper
-# mean of critics minus clipped std = optimistic estimate
-# high std = critics disagree = uncertain state = exploration bonus
+def soft_update(source, target, tau):
+    for s, t in zip(source.parameters(), target.parameters()):
+        t.data.mul_(1 - tau)
+        t.data.add_(tau * s.data)
+
+
+# Algorithm 5 from the paper, written for reward-maximization framing.
+# Paper uses cost-minimization with mean - std; for reward we flip to mean + std.
+# High std = critics disagree = uncertain state => optimistic upward bonus encourages exploration.
 def optimistic_q(q_list, sigma):
     stacked = torch.stack(q_list, dim=0)
     mean_q = stacked.mean(dim=0)
     std_q = torch.clamp(stacked.std(dim=0), 0, sigma)
-    return mean_q - std_q
+    return mean_q + std_q
 
 
-# same as f-IRL agent but with L critics instead of 1
+# One SOAR critic = a SAC double-Q pair (Q1, Q2) with its own target copies and optimizer.
+class DiscreteDoubleQ:
+    def __init__(self, obs_dim, act_dim, hidden, lr, device):
+        self.device = device
+        self.q1 = QNetDiscrete(obs_dim, act_dim, hidden).to(device)
+        self.q2 = QNetDiscrete(obs_dim, act_dim, hidden).to(device)
+        self.q1_target = QNetDiscrete(obs_dim, act_dim, hidden).to(device)
+        self.q2_target = QNetDiscrete(obs_dim, act_dim, hidden).to(device)
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
+        self.optimizer = Adam(
+            list(self.q1.parameters()) + list(self.q2.parameters()), lr=lr
+        )
+
+    def soft_v(self, obs, alpha, target=False):
+        if target:
+            q = torch.min(self.q1_target(obs), self.q2_target(obs))
+        else:
+            q = torch.min(self.q1(obs), self.q2(obs))
+        return alpha * torch.logsumexp(q / alpha, dim=1, keepdim=True)
+
+    def q_min(self, obs):
+        return torch.min(self.q1(obs), self.q2(obs))
+
+    def update_targets(self, tau):
+        soft_update(self.q1, self.q1_target, tau)
+        soft_update(self.q2, self.q2_target, tau)
+
+
+class ContinuousDoubleQ:
+    def __init__(self, obs_dim, act_dim, hidden, lr, device):
+        self.device = device
+        self.q1 = QNetContinuous(obs_dim, act_dim, hidden).to(device)
+        self.q2 = QNetContinuous(obs_dim, act_dim, hidden).to(device)
+        self.q1_target = QNetContinuous(obs_dim, act_dim, hidden).to(device)
+        self.q2_target = QNetContinuous(obs_dim, act_dim, hidden).to(device)
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
+        self.optimizer = Adam(
+            list(self.q1.parameters()) + list(self.q2.parameters()), lr=lr
+        )
+
+    def q_min(self, obs, action):
+        return torch.min(self.q1(obs, action), self.q2(obs, action))
+
+    def q_min_target(self, obs, action):
+        return torch.min(self.q1_target(obs, action), self.q2_target(obs, action))
+
+    def update_targets(self, tau):
+        soft_update(self.q1, self.q1_target, tau)
+        soft_update(self.q2, self.q2_target, tau)
+
+
 class SOARAgentDiscrete:
     def __init__(self, obs_dim, act_dim, cfg, device):
         self.gamma = cfg["gamma"]
         self.device = device
         self.alpha = torch.tensor(cfg["alpha"]).to(device)
         self.sigma = cfg["sigma"]
+        self.tau = cfg["tau"]
+        self.n_critics = cfg["n_critics"]
         hidden = cfg["hidden"]
-        n = cfg["n_critics"]
 
-        self.q_nets = nn.ModuleList([
-            QNetDiscrete(obs_dim, act_dim, hidden).to(device) for _ in range(n)
-        ])
-        self.target_nets = nn.ModuleList([
-            QNetDiscrete(obs_dim, act_dim, hidden).to(device) for _ in range(n)
-        ])
-        for q, t in zip(self.q_nets, self.target_nets):
-            t.load_state_dict(q.state_dict())
+        self.critics = [
+            DiscreteDoubleQ(obs_dim, act_dim, hidden, cfg["lr"], device)
+            for _ in range(self.n_critics)
+        ]
 
-        self.optimizers = [Adam(q.parameters(), lr=cfg["lr"]) for q in self.q_nets]
-
-    def _soft_v(self, q_net, obs):
-        q = q_net(obs)
-        return self.alpha * torch.logsumexp(q / self.alpha, dim=1, keepdim=True)
-
-    def get_targetV(self, obs):
-        v_list = [self._soft_v(t, obs) for t in self.target_nets]
-        return optimistic_q(v_list, self.sigma)
-
-    def choose_action(self, obs_np):
+    def choose_action(self, obs_np, deterministic=False):
         obs = torch.FloatTensor(obs_np).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            q_list = [q(obs) for q in self.q_nets]
+            q_list = [c.q_min(obs) for c in self.critics]
             q_opt = optimistic_q(q_list, self.sigma)
+            if deterministic:
+                return int(q_opt.argmax(dim=1).item())
             dist = Categorical(F.softmax(q_opt / self.alpha, dim=1))
         return dist.sample().item()
 
-    def update(self, obs_b, action_b, reward_b, next_obs_b, done_b):
+    def update_one(self, critic, obs_b, action_b, reward_b, next_obs_b, done_b):
+        # plain SAC backup (no optimism in the target — Algorithm 7)
         with torch.no_grad():
-            next_v = self.get_targetV(next_obs_b)
+            next_v = critic.soft_v(next_obs_b, self.alpha, target=True)
             target_q = reward_b + self.gamma * (1 - done_b) * next_v
 
-        # update each critic independently
-        for q_net, opt in zip(self.q_nets, self.optimizers):
-            current_q = q_net(obs_b).gather(1, action_b.long())
-            loss = F.mse_loss(current_q, target_q)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+        q1 = critic.q1(obs_b).gather(1, action_b.long())
+        q2 = critic.q2(obs_b).gather(1, action_b.long())
+        loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
 
-    def update_target(self):
-        for q, t in zip(self.q_nets, self.target_nets):
-            t.load_state_dict(q.state_dict())
+        critic.optimizer.zero_grad()
+        loss.backward()
+        critic.optimizer.step()
+        critic.update_targets(self.tau)
 
 
 class SOARAgentContinuous:
@@ -184,30 +241,16 @@ class SOARAgentContinuous:
         self.device = device
         self.alpha = cfg["alpha"]
         self.sigma = cfg["sigma"]
+        self.tau = cfg["tau"]
+        self.n_critics = cfg["n_critics"]
         hidden = cfg["hidden"]
-        n = cfg["n_critics"]
 
-        self.q_nets = nn.ModuleList([
-            QNetContinuous(obs_dim, act_dim, hidden).to(device) for _ in range(n)
-        ])
-        self.target_nets = nn.ModuleList([
-            QNetContinuous(obs_dim, act_dim, hidden).to(device) for _ in range(n)
-        ])
-        for q, t in zip(self.q_nets, self.target_nets):
-            t.load_state_dict(q.state_dict())
-
+        self.critics = [
+            ContinuousDoubleQ(obs_dim, act_dim, hidden, cfg["lr"], device)
+            for _ in range(self.n_critics)
+        ]
         self.policy = PolicyContinuous(obs_dim, act_dim, hidden, act_limit).to(device)
-        self.q_optimizers = [Adam(q.parameters(), lr=cfg["lr"]) for q in self.q_nets]
         self.pi_optimizer = Adam(self.policy.parameters(), lr=cfg["lr"])
-
-    def _val(self, q_net, obs):
-        action, log_prob = self.policy(obs)
-        return q_net(obs, action) - self.alpha * log_prob
-
-    def get_targetV(self, obs):
-        with torch.no_grad():
-            v_list = [self._val(t, obs) for t in self.target_nets]
-        return optimistic_q(v_list, self.sigma)
 
     def choose_action(self, obs_np, deterministic=False):
         obs = torch.FloatTensor(obs_np).unsqueeze(0).to(self.device)
@@ -215,30 +258,33 @@ class SOARAgentContinuous:
             action, _ = self.policy(obs, deterministic=deterministic)
         return action.squeeze(0).cpu().numpy()
 
-    def update(self, obs_b, action_b, reward_b, next_obs_b, done_b):
-        # critic updates
+    def update_one(self, critic, obs_b, action_b, reward_b, next_obs_b, done_b):
+        # plain SAC critic backup, no optimism in target (Algorithm 7)
         with torch.no_grad():
-            next_v = self.get_targetV(next_obs_b)
+            next_action, next_log_prob = self.policy(next_obs_b)
+            next_q = critic.q_min_target(next_obs_b, next_action)
+            next_v = next_q - self.alpha * next_log_prob
             target_q = reward_b + self.gamma * (1 - done_b) * next_v
 
-        for q_net, opt in zip(self.q_nets, self.q_optimizers):
-            q_loss = F.mse_loss(q_net(obs_b, action_b), target_q)
-            opt.zero_grad()
-            q_loss.backward()
-            opt.step()
+        q1 = critic.q1(obs_b, action_b)
+        q2 = critic.q2(obs_b, action_b)
+        q_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
 
-        # actor update - use optimistic Q (this is the soar part)
+        critic.optimizer.zero_grad()
+        q_loss.backward()
+        critic.optimizer.step()
+        critic.update_targets(self.tau)
+
+    def update_actor(self, obs_b):
+        # SOAR's actor update uses optimistic Q over the L critics (Algorithm 6 lines 14-16)
         action_pi, log_prob = self.policy(obs_b)
-        q_opt = optimistic_q([q(obs_b, action_pi) for q in self.q_nets], self.sigma)
+        q_list = [c.q_min(obs_b, action_pi) for c in self.critics]
+        q_opt = optimistic_q(q_list, self.sigma)
         pi_loss = (self.alpha * log_prob - q_opt).mean()
 
         self.pi_optimizer.zero_grad()
         pi_loss.backward()
         self.pi_optimizer.step()
-
-    def update_target(self):
-        for q, t in zip(self.q_nets, self.target_nets):
-            t.load_state_dict(q.state_dict())
 
 
 class ReplayBuffer:
@@ -247,10 +293,10 @@ class ReplayBuffer:
         self.buffer = []
         self.pos = 0
 
-    def push(self, obs, action, reward, next_obs, done):
+    def push(self, obs, action, reward, next_obs, done_no_max):
         if len(self.buffer) < self.capacity:
             self.buffer.append(None)
-        self.buffer[self.pos] = (obs, action, reward, next_obs, done)
+        self.buffer[self.pos] = (obs, action, reward, next_obs, done_no_max)
         self.pos = (self.pos + 1) % self.capacity
 
     def sample(self, batch_size, device):
@@ -282,20 +328,33 @@ def load_expert_data(env_name, K):
     return data
 
 
-def collect_agent_states(agent, env_name, n_trajs, discrete):
+def collect_agent_trajectories(agent, env_name, n_trajs, discrete, max_T):
+    """returns (trajs (n, T, d) padded, flat_states (real only), lengths (n,))."""
     env = gym.make(env_name)
-    states = []
+    trajs = []
+    flat_states = []
+    lengths = []
     for ep in range(n_trajs):
         obs, _ = env.reset(seed=ep)
+        traj = []
         done = False
-        while not done:
-            action = agent.choose_action(obs) if discrete \
-                     else agent.choose_action(obs, deterministic=False)
-            states.append(obs.copy())
+        steps = 0
+        while not done and steps < max_T:
+            traj.append(obs.copy())
+            flat_states.append(obs.copy())
+            if discrete:
+                action = agent.choose_action(obs)
+            else:
+                action = agent.choose_action(obs, deterministic=False)
             obs, _, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
+            steps += 1
+        lengths.append(steps)
+        while len(traj) < max_T:
+            traj.append(obs.copy())
+        trajs.append(np.array(traj))
     env.close()
-    return np.array(states)
+    return np.array(trajs), np.array(flat_states), np.array(lengths)
 
 
 def evaluate_policy(agent, env_name, n_episodes, discrete):
@@ -306,8 +365,7 @@ def evaluate_policy(agent, env_name, n_episodes, discrete):
         done = False
         ep_ret = 0.0
         while not done:
-            action = agent.choose_action(obs, deterministic=True) if not discrete \
-                     else agent.choose_action(obs)
+            action = agent.choose_action(obs, deterministic=True)
             obs, r, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             ep_ret += r
@@ -316,9 +374,41 @@ def evaluate_policy(agent, env_name, n_episodes, discrete):
     return float(np.mean(returns))
 
 
+def env_is_time_limited_only(env_name):
+    return env_name == "Pendulum-v1"
+
+
+def reward_loss_firl(div, agent_trajs, traj_lengths, disc, reward_func, device):
+    """f-IRL covariance objective with per-step mask for early-terminating episodes."""
+    N, T, d = agent_trajs.shape
+    s_vec = agent_trajs.reshape(-1, d)
+    logits = disc.log_density_ratio(s_vec)
+
+    if div == "fkl":
+        t1_per = torch.exp(logits)
+    elif div == "rkl":
+        t1_per = logits
+    elif div == "js":
+        t1_per = F.softplus(logits)
+    else:
+        raise ValueError(f"unknown div {div}")
+
+    mask = torch.zeros(N, T, device=device)
+    for i, l in enumerate(traj_lengths):
+        mask[i, :int(l)] = 1.0
+
+    t1 = ((-t1_per).view(N, T) * mask).sum(dim=1)
+
+    s_tensor = torch.FloatTensor(s_vec).to(device)
+    t2 = (reward_func.r(s_tensor).view(N, T) * mask).sum(dim=1)
+
+    surrogate = (t1 * t2).mean() - t1.mean() * t2.mean()
+    return surrogate / T
+
+
 def train(env_name, K, seed, cfg):
     print(f"\n{'='*55}")
-    print(f"SOAR+f-IRL | {env_name} | K={K} | seed={seed} | L={cfg['n_critics']}")
+    print(f"SOAR+f-IRL | {env_name} | K={K} | seed={seed} | L={cfg['n_critics']} | sigma={cfg['sigma']}")
     print(f"{'='*55}")
 
     random.seed(seed)
@@ -327,9 +417,11 @@ def train(env_name, K, seed, cfg):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     discrete = cfg["discrete"]
+    pendulum_like = env_is_time_limited_only(env_name)
 
     env = gym.make(env_name)
     obs_dim = env.observation_space.shape[0]
+    max_T = env.spec.max_episode_steps
 
     if discrete:
         act_dim = env.action_space.n
@@ -346,17 +438,31 @@ def train(env_name, K, seed, cfg):
         device=device,
     )
 
+    reward_func = MLPReward(
+        input_dim=obs_dim,
+        hidden_sizes=(cfg["hidden"], cfg["hidden"]),
+        hid_act="tanh",
+        clamp_magnitude=10.0,
+        device=device,
+    ).to(device)
+    reward_optimizer = Adam(reward_func.parameters(), lr=cfg["reward_lr"], weight_decay=1e-4)
+
     expert_data = load_expert_data(env_name, K)
     expert_states = expert_data["obs"]
 
-    buf = ReplayBuffer(capacity=100_000)
+    # one buffer per critic (independent samples — required by Corollary 4.11)
+    bufs = [ReplayBuffer(capacity=100_000) for _ in range(cfg["n_critics"])]
+    n_critics = cfg["n_critics"]
 
+    # warm-up: write random transitions to all buffers so each critic has something to train on
     obs, _ = env.reset(seed=seed)
     for _ in range(cfg["batch_size"]):
         action = env.action_space.sample()
         next_obs, _, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
-        buf.push(obs, action, 0.0, next_obs, float(done))
+        done_no_max = 0.0 if pendulum_like else float(terminated)
+        # Each transition goes to ONE randomly selected buffer to keep them independent.
+        bufs[random.randrange(n_critics)].push(obs, action, 0.0, next_obs, done_no_max)
         obs = next_obs if not done else env.reset(seed=seed)[0]
 
     best_return = -float("inf")
@@ -366,45 +472,55 @@ def train(env_name, K, seed, cfg):
     for outer_itr in range(cfg["outer_iters"]):
         print(f"\n--- outer iter {outer_itr+1}/{cfg['outer_iters']} ---")
 
-        # step 1: run SAC with current discriminator reward
         obs, _ = env.reset(seed=seed + outer_itr)
         for _ in range(steps_per_outer):
             action = agent.choose_action(obs)
             next_obs, _, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
+            done_no_max = float(terminated) if not pendulum_like else 0.0
 
             with torch.no_grad():
-                reward = float(disc.log_density_ratio(np.array([obs])).cpu().item())
+                r = float(reward_func.get_scalar_reward(np.array([obs]))[0])
 
-            buf.push(obs, action, reward, next_obs, float(done))
+            # send this transition to one critic's buffer (round-robin via random pick)
+            buf_idx = random.randrange(n_critics)
+            bufs[buf_idx].push(obs, action, r, next_obs, done_no_max)
             obs = next_obs if not done else env.reset(seed=seed + sac_step)[0]
             sac_step += 1
 
-            if len(buf) >= cfg["batch_size"]:
-                obs_b, next_obs_b, action_b, reward_b, done_b = buf.sample(
-                    cfg["batch_size"], device)
-                agent.update(obs_b, action_b, reward_b, next_obs_b, done_b)
+            # each critic trains on its own buffer
+            for i, c in enumerate(agent.critics):
+                if len(bufs[i]) >= cfg["batch_size"]:
+                    obs_b, next_obs_b, action_b, reward_b, done_b = bufs[i].sample(
+                        cfg["batch_size"], device)
+                    agent.update_one(c, obs_b, action_b, reward_b, next_obs_b, done_b)
 
-            if sac_step % 1000 == 0:
-                agent.update_target()
+            # continuous actor update: sample from any buffer (pooled is fine for the actor),
+            # but we use buf 0 by convention. Optimism is applied only here.
+            if not discrete:
+                if len(bufs[0]) >= cfg["batch_size"]:
+                    obs_b, _, _, _, _ = bufs[0].sample(cfg["batch_size"], device)
+                    agent.update_actor(obs_b)
 
-        # step 2: update discriminator
-        agent_states = collect_agent_states(agent, env_name, cfg["collect_trajs"], discrete)
-        print(f"  collected {len(agent_states)} agent states")
+        # discriminator + reward_func update
+        agent_trajs, agent_flat, traj_lengths = collect_agent_trajectories(
+            agent, env_name, cfg["collect_trajs"], discrete, max_T
+        )
+        print(f"  collected {agent_trajs.shape[0]} trajs, mean real length {traj_lengths.mean():.1f}")
 
-        disc_loss = disc.learn(expert_states, agent_states, iter=cfg["disc_iter"])
+        disc_loss = disc.learn(expert_states, agent_flat, iter=cfg["disc_iter"])
         print(f"  disc loss: {np.mean(disc_loss[-10:]):.4f}")
 
-        # step 3: re-label buffer
-        obs_arr = np.array([t[0] for t in buf.buffer if t is not None])
-        with torch.no_grad():
-            new_rewards = disc.log_density_ratio(obs_arr).cpu().numpy()
-        idx = 0
-        for i, t in enumerate(buf.buffer):
-            if t is not None:
-                o, a, _, no, d = t
-                buf.buffer[i] = (o, a, float(new_rewards[idx]), no, d)
-                idx += 1
+        for _ in range(cfg["reward_grad_steps"]):
+            loss = reward_loss_firl(cfg["div"], agent_trajs, traj_lengths, disc, reward_func, device)
+            reward_optimizer.zero_grad()
+            loss.backward()
+            reward_optimizer.step()
+        print(f"  reward loss: {loss.item():.4f}")
+
+        # NOTE: no buffer relabel — matches f-IRL reference reinitialize=False branch.
+        # Each per-critic buffer's Bellman targets stay self-consistent with the reward
+        # in force when the transitions were stored; SAC adapts via fresh transitions.
 
         mean_ret = evaluate_policy(agent, env_name, cfg["eval_eps"], discrete)
         if mean_ret > best_return:
@@ -424,6 +540,9 @@ def main():
     parser.add_argument("--K", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--all", action="store_true")
+    parser.add_argument("--train_steps", type=int, default=None)
+    parser.add_argument("--outer_iters", type=int, default=None)
+    parser.add_argument("--sigma", type=float, default=None)
     args = parser.parse_args()
 
     runs = (
@@ -443,7 +562,13 @@ def main():
             writer.writeheader()
 
         for env_name, K, seed in runs:
-            cfg = CONFIG[env_name]
+            cfg = dict(CONFIG[env_name])
+            if args.train_steps is not None:
+                cfg["train_steps"] = args.train_steps
+            if args.outer_iters is not None:
+                cfg["outer_iters"] = args.outer_iters
+            if args.sigma is not None:
+                cfg["sigma"] = args.sigma
             mean_return, best_return = train(env_name, K, seed, cfg)
             writer.writerow(dict(
                 env=env_name, algo="soar_f_irl", K=K, seed=seed,

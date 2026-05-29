@@ -36,6 +36,7 @@ CONFIG = {
         "hidden": 256,
         "discrete": True,
         "alpha": 0.1,
+        "tau": 0.005,
     },
     "Pendulum-v1": {
         "train_steps": 50_000,
@@ -47,6 +48,7 @@ CONFIG = {
         "hidden": 256,
         "discrete": False,
         "alpha": 0.2,
+        "tau": 0.005,
     },
 }
 
@@ -109,18 +111,31 @@ class PolicyContinuous(nn.Module):
         return action, log_prob
 
 
-# agent for cartpole - wraps QNetDiscrete to match iq_loss interface
+# soft polyak update
+def soft_update(source, target, tau):
+    for s, t in zip(source.parameters(), target.parameters()):
+        t.data.mul_(1 - tau)
+        t.data.add_(tau * s.data)
+
+
+# agent for cartpole - double Q
 class IQAgentDiscrete:
     def __init__(self, obs_dim, act_dim, cfg, device):
         self.gamma = cfg["gamma"]
         self.device = device
         self.alpha = torch.tensor(cfg["alpha"]).to(device)
+        self.tau = cfg["tau"]
         hidden = cfg["hidden"]
 
-        self.q_net = QNetDiscrete(obs_dim, act_dim, hidden).to(device)
-        self.target_net = QNetDiscrete(obs_dim, act_dim, hidden).to(device)
-        self.target_net.load_state_dict(self.q_net.state_dict())
-        self.optimizer = Adam(self.q_net.parameters(), lr=cfg["lr"])
+        self.q1 = QNetDiscrete(obs_dim, act_dim, hidden).to(device)
+        self.q2 = QNetDiscrete(obs_dim, act_dim, hidden).to(device)
+        self.q1_target = QNetDiscrete(obs_dim, act_dim, hidden).to(device)
+        self.q2_target = QNetDiscrete(obs_dim, act_dim, hidden).to(device)
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
+        self.optimizer = Adam(
+            list(self.q1.parameters()) + list(self.q2.parameters()), lr=cfg["lr"]
+        )
 
         # iq_loss reads these from agent.args
         self.args = types.SimpleNamespace(
@@ -137,27 +152,41 @@ class IQAgentDiscrete:
             )
         )
 
+    def _v_from_q(self, q_vals):
+        return self.alpha * torch.logsumexp(q_vals / self.alpha, dim=1, keepdim=True)
+
     def getV(self, obs):
-        q = self.q_net(obs)
-        return self.alpha * torch.logsumexp(q / self.alpha, dim=1, keepdim=True)
+        q1 = self.q1(obs)
+        q2 = self.q2(obs)
+        q_min = torch.min(q1, q2)
+        return self._v_from_q(q_min)
 
     def get_targetV(self, obs):
-        q = self.target_net(obs)
-        return self.alpha * torch.logsumexp(q / self.alpha, dim=1, keepdim=True)
+        q1 = self.q1_target(obs)
+        q2 = self.q2_target(obs)
+        q_min = torch.min(q1, q2)
+        return self._v_from_q(q_min)
 
     def critic(self, obs, action):
-        q = self.q_net(obs)
-        return q.gather(1, action.long())
+        # min over the pair, as required by the iq_loss objective
+        q1 = self.q1(obs).gather(1, action.long())
+        q2 = self.q2(obs).gather(1, action.long())
+        return torch.min(q1, q2)
 
-    def choose_action(self, obs_np):
+    def choose_action(self, obs_np, deterministic=False):
         obs = torch.FloatTensor(obs_np).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            q = self.q_net(obs)
+            q1 = self.q1(obs)
+            q2 = self.q2(obs)
+            q = torch.min(q1, q2)
+            if deterministic:
+                return int(q.argmax(dim=1).item())
             dist = Categorical(F.softmax(q / self.alpha, dim=1))
         return dist.sample().item()
 
     def update_target(self):
-        self.target_net.load_state_dict(self.q_net.state_dict())
+        soft_update(self.q1, self.q1_target, self.tau)
+        soft_update(self.q2, self.q2_target, self.tau)
 
 
 # agent for pendulum
@@ -166,14 +195,20 @@ class IQAgentContinuous:
         self.gamma = cfg["gamma"]
         self.device = device
         self.alpha = cfg["alpha"]
+        self.tau = cfg["tau"]
         hidden = cfg["hidden"]
 
-        self.q_net = QNetContinuous(obs_dim, act_dim, hidden).to(device)
-        self.target_net = QNetContinuous(obs_dim, act_dim, hidden).to(device)
-        self.target_net.load_state_dict(self.q_net.state_dict())
+        self.q1 = QNetContinuous(obs_dim, act_dim, hidden).to(device)
+        self.q2 = QNetContinuous(obs_dim, act_dim, hidden).to(device)
+        self.q1_target = QNetContinuous(obs_dim, act_dim, hidden).to(device)
+        self.q2_target = QNetContinuous(obs_dim, act_dim, hidden).to(device)
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
         self.policy = PolicyContinuous(obs_dim, act_dim, hidden, act_limit).to(device)
 
-        self.q_optimizer = Adam(self.q_net.parameters(), lr=cfg["lr"])
+        self.q_optimizer = Adam(
+            list(self.q1.parameters()) + list(self.q2.parameters()), lr=cfg["lr"]
+        )
         self.pi_optimizer = Adam(self.policy.parameters(), lr=cfg["lr"])
 
         self.args = types.SimpleNamespace(
@@ -190,19 +225,20 @@ class IQAgentContinuous:
             )
         )
 
-    def _val(self, obs, net):
+    def _val(self, obs, q_a, q_b):
         action, log_prob = self.policy(obs)
-        return net(obs, action) - self.alpha * log_prob
+        q = torch.min(q_a(obs, action), q_b(obs, action))
+        return q - self.alpha * log_prob
 
     def getV(self, obs):
-        return self._val(obs, self.q_net)
+        return self._val(obs, self.q1, self.q2)
 
     def get_targetV(self, obs):
         with torch.no_grad():
-            return self._val(obs, self.target_net)
+            return self._val(obs, self.q1_target, self.q2_target)
 
     def critic(self, obs, action):
-        return self.q_net(obs, action)
+        return torch.min(self.q1(obs, action), self.q2(obs, action))
 
     def choose_action(self, obs_np, deterministic=False):
         obs = torch.FloatTensor(obs_np).unsqueeze(0).to(self.device)
@@ -211,24 +247,27 @@ class IQAgentContinuous:
         return action.squeeze(0).cpu().numpy()
 
     def update_target(self):
-        self.target_net.load_state_dict(self.q_net.state_dict())
+        soft_update(self.q1, self.q1_target, self.tau)
+        soft_update(self.q2, self.q2_target, self.tau)
 
 
+# ring buffer that stores transitions, is_expert flag managed externally
 class ReplayBuffer:
     def __init__(self, capacity):
         self.capacity = capacity
         self.buffer = []
         self.pos = 0
 
-    def push(self, obs, action, reward, next_obs, done, is_expert):
+    def push(self, obs, action, reward, next_obs, done_no_max):
+        # done_no_max: 1 only on a true termination (not truncation), used to mask bootstrap
         if len(self.buffer) < self.capacity:
             self.buffer.append(None)
-        self.buffer[self.pos] = (obs, action, reward, next_obs, done, is_expert)
+        self.buffer[self.pos] = (obs, action, reward, next_obs, done_no_max)
         self.pos = (self.pos + 1) % self.capacity
 
     def sample(self, batch_size, device):
         batch = random.sample([t for t in self.buffer if t is not None], batch_size)
-        obs, action, reward, next_obs, done, is_expert = zip(*batch)
+        obs, action, reward, next_obs, done = zip(*batch)
 
         def to_t(x):
             return torch.FloatTensor(np.array(x)).to(device)
@@ -238,15 +277,33 @@ class ReplayBuffer:
         action = to_t(action)
         reward = to_t(reward).unsqueeze(1)
         done = to_t(done).unsqueeze(1)
-        is_expert = torch.BoolTensor(np.array(is_expert)).unsqueeze(1).to(device)
 
         if action.dim() == 1:
             action = action.unsqueeze(1)
 
-        return obs, next_obs, action, reward, done, is_expert
+        return obs, next_obs, action, reward, done
 
     def __len__(self):
         return len([t for t in self.buffer if t is not None])
+
+
+def sample_iq_batch(expert_buf, policy_buf, half_batch, device):
+    """draw equal-size expert and policy minibatches, concat with is_expert flag."""
+    obs_e, next_obs_e, action_e, reward_e, done_e = expert_buf.sample(half_batch, device)
+    obs_p, next_obs_p, action_p, reward_p, done_p = policy_buf.sample(half_batch, device)
+
+    obs = torch.cat([obs_p, obs_e], dim=0)
+    next_obs = torch.cat([next_obs_p, next_obs_e], dim=0)
+    action = torch.cat([action_p, action_e], dim=0)
+    reward = torch.cat([reward_p, reward_e], dim=0)
+    done = torch.cat([done_p, done_e], dim=0)
+
+    is_expert = torch.cat(
+        [torch.zeros(half_batch, 1, dtype=torch.bool, device=device),
+         torch.ones(half_batch, 1, dtype=torch.bool, device=device)],
+        dim=0
+    )
+    return obs, next_obs, action, reward, done, is_expert
 
 
 def load_expert_data(env_name, K):
@@ -266,14 +323,18 @@ def evaluate_policy(agent, env_name, n_episodes, discrete):
         done = False
         ep_ret = 0.0
         while not done:
-            action = agent.choose_action(obs, deterministic=True) if not discrete \
-                     else agent.choose_action(obs)
+            action = agent.choose_action(obs, deterministic=True)
             obs, r, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             ep_ret += r
         returns.append(ep_ret)
     env.close()
     return float(np.mean(returns))
+
+
+def env_is_time_limited_only(env_name):
+    # Pendulum-v1 has no terminal state; CartPole-v1 does.
+    return env_name == "Pendulum-v1"
 
 
 def train(env_name, K, seed, cfg):
@@ -287,6 +348,7 @@ def train(env_name, K, seed, cfg):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     discrete = cfg["discrete"]
+    pendulum_like = env_is_time_limited_only(env_name)
 
     env = gym.make(env_name)
     obs_dim = env.observation_space.shape[0]
@@ -299,33 +361,43 @@ def train(env_name, K, seed, cfg):
         act_limit = float(env.action_space.high[0])
         agent = IQAgentContinuous(obs_dim, act_dim, act_limit, cfg, device)
 
-    buf = ReplayBuffer(capacity=100_000)
+    # separate buffers: expert is never overwritten by agent data
+    expert_buf = ReplayBuffer(capacity=200_000)
+    policy_buf = ReplayBuffer(capacity=100_000)
 
-    # load expert data into buffer, flagged as expert
     data = load_expert_data(env_name, K)
-    n = min(len(data["obs"]), 50_000)
+    n = len(data["obs"])
     for i in range(n):
-        buf.push(data["obs"][i], data["actions"][i], 0.0,
-                 data["next_obs"][i], data["dones"][i], True)
-    print(f"  loaded {n} expert transitions")
+        # for Pendulum the dataset's "done" is a truncation -> do not mask bootstrap
+        ds_done = float(data["dones"][i])
+        done_no_max = 0.0 if pendulum_like else ds_done
+        expert_buf.push(
+            data["obs"][i], data["actions"][i], 0.0,
+            data["next_obs"][i], done_no_max,
+        )
+    print(f"  loaded {n} expert transitions into protected expert buffer")
 
     obs, _ = env.reset(seed=seed)
     best_return = -float("inf")
+    half_batch = cfg["batch_size"] // 2
 
     for step in range(1, cfg["train_steps"] + 1):
         # collect agent transition
         action = agent.choose_action(obs)
         next_obs, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
-        buf.push(obs, action, reward, next_obs, float(done), False)
+        # bootstrap mask: only true terminations zero the future value
+        done_no_max = float(terminated)
+        policy_buf.push(obs, action, reward, next_obs, done_no_max)
         obs = next_obs if not done else env.reset(seed=seed + step)[0]
 
-        if len(buf) < cfg["batch_size"] * 2:
+        if len(policy_buf) < half_batch:
             continue
 
-        # IQ-Learn update
-        obs_b, next_obs_b, action_b, reward_b, done_b, is_expert_b = buf.sample(
-            cfg["batch_size"], device)
+        # balanced IQ-Learn batch from two separate buffers
+        obs_b, next_obs_b, action_b, reward_b, done_b, is_expert_b = sample_iq_batch(
+            expert_buf, policy_buf, half_batch, device
+        )
 
         current_Q = agent.critic(obs_b, action_b)
         current_v = agent.getV(obs_b)
@@ -346,14 +418,17 @@ def train(env_name, K, seed, cfg):
             agent.q_optimizer.step()
 
             action_pi, log_prob = agent.policy(obs_b)
-            q_pi = agent.q_net(obs_b, action_pi)
+            q_pi = torch.min(
+                agent.q1(obs_b, action_pi),
+                agent.q2(obs_b, action_pi),
+            )
             pi_loss = (agent.alpha * log_prob - q_pi).mean()
             agent.pi_optimizer.zero_grad()
             pi_loss.backward()
             agent.pi_optimizer.step()
 
-        if step % 1000 == 0:
-            agent.update_target()
+        # soft target update every step
+        agent.update_target()
 
         if step % cfg["eval_every"] == 0:
             mean_ret = evaluate_policy(agent, env_name, cfg["eval_eps"], discrete)
@@ -374,6 +449,8 @@ def main():
     parser.add_argument("--K", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--all", action="store_true")
+    parser.add_argument("--train_steps", type=int, default=None,
+                        help="override CONFIG train_steps (useful for smoke tests)")
     args = parser.parse_args()
 
     runs = (
@@ -393,7 +470,9 @@ def main():
             writer.writeheader()
 
         for env_name, K, seed in runs:
-            cfg = CONFIG[env_name]
+            cfg = dict(CONFIG[env_name])
+            if args.train_steps is not None:
+                cfg["train_steps"] = args.train_steps
             mean_return = train(env_name, K, seed, cfg)
             writer.writerow(dict(
                 env=env_name, algo="iq_learn", K=K, seed=seed,
