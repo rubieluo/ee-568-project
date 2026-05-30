@@ -24,6 +24,17 @@ from iq import iq_loss
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 RESULTS_CSV = os.path.join(RESULTS_DIR, "iqlearn_results.csv")
+TRACE_CSV = os.path.join(RESULTS_DIR, "training_trace.csv")
+TRACE_FIELDS = ["algo", "env", "K", "seed", "step", "eval_return"]
+
+
+def append_trace(algo, env, K, seed, step, eval_return):
+    write_header = not os.path.exists(TRACE_CSV)
+    with open(TRACE_CSV, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=TRACE_FIELDS)
+        if write_header:
+            w.writeheader()
+        w.writerow(dict(algo=algo, env=env, K=K, seed=seed, step=step, eval_return=eval_return))
 
 CONFIG = {
     "CartPole-v1": {
@@ -434,6 +445,7 @@ def train(env_name, K, seed, cfg):
             mean_ret = evaluate_policy(agent, env_name, cfg["eval_eps"], discrete)
             if mean_ret > best_return:
                 best_return = mean_ret
+            append_trace("iq_learn", env_name, K, seed, step, mean_ret)
             print(f"  step {step}/{cfg['train_steps']} | eval={mean_ret:.1f} | best={best_return:.1f} | loss={loss_dict['total_loss']:.4f}")
 
     env.close()
