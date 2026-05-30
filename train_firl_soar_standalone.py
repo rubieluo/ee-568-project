@@ -459,7 +459,7 @@ def train(env_name, K, seed, cfg):
     reward_optimizer = Adam(reward_func.parameters(), lr=cfg["reward_lr"], weight_decay=1e-4)
 
     expert_data = load_expert_data(env_name, K)
-    expert_states = expert_data["obs"]
+    expert_states = np.asarray(expert_data["obs"])  # materialize — npz views re-read from disk per access
 
     # one buffer per critic (independent samples — required by Corollary 4.11)
     bufs = [ReplayBuffer(capacity=100_000) for _ in range(cfg["n_critics"])]

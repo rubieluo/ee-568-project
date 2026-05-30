@@ -377,14 +377,20 @@ def train(env_name, K, seed, cfg):
     policy_buf = ReplayBuffer(capacity=100_000)
 
     data = load_expert_data(env_name, K)
-    n = len(data["obs"])
+    # materialize arrays once: NpzFile views re-read from disk on every index,
+    # which silently turned 50k pushes into a 200s loop that the OS killed.
+    ds_obs = np.asarray(data["obs"])
+    ds_act = np.asarray(data["actions"])
+    ds_nob = np.asarray(data["next_obs"])
+    ds_don = np.asarray(data["dones"])
+    n = len(ds_obs)
     for i in range(n):
         # for Pendulum the dataset's "done" is a truncation -> do not mask bootstrap
-        ds_done = float(data["dones"][i])
+        ds_done = float(ds_don[i])
         done_no_max = 0.0 if pendulum_like else ds_done
         expert_buf.push(
-            data["obs"][i], data["actions"][i], 0.0,
-            data["next_obs"][i], done_no_max,
+            ds_obs[i], ds_act[i], 0.0,
+            ds_nob[i], done_no_max,
         )
     print(f"  loaded {n} expert transitions into protected expert buffer")
 
