@@ -39,7 +39,7 @@ def append_trace(algo, env, K, seed, step, eval_return):
 # hyperparams
 CONFIG = {
     "CartPole-v1": {
-        "train_steps": 40_000,
+        "train_steps": 30_000,   # smoke-test verified
         "batch_size": 256,
         "lr": 3e-4,
         "gamma": 0.99,
@@ -49,14 +49,14 @@ CONFIG = {
         "alpha": 0.1,
         "tau": 0.005,
         "disc_iter": 20,
-        "outer_iters": 40,
+        "outer_iters": 20,       # smoke-test verified
         "collect_trajs": 10,
         "reward_grad_steps": 10,
         "reward_lr": 3e-4,
         "div": "fkl",
     },
     "Pendulum-v1": {
-        "train_steps": 50_000,
+        "train_steps": 30_000,   # smoke-test verified
         "batch_size": 256,
         "lr": 1e-4,
         "gamma": 0.99,
@@ -66,7 +66,7 @@ CONFIG = {
         "alpha": 0.2,
         "tau": 0.005,
         "disc_iter": 20,
-        "outer_iters": 40,
+        "outer_iters": 20,       # smoke-test verified
         "collect_trajs": 10,
         "reward_grad_steps": 10,
         "reward_lr": 3e-4,

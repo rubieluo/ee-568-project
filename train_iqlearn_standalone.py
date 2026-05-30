@@ -38,7 +38,7 @@ def append_trace(algo, env, K, seed, step, eval_return):
 
 CONFIG = {
     "CartPole-v1": {
-        "train_steps": 40_000,
+        "train_steps": 30_000,   # smoke-test verified
         "batch_size": 256,
         "lr": 3e-4,
         "gamma": 0.99,
@@ -50,7 +50,7 @@ CONFIG = {
         "tau": 0.005,
     },
     "Pendulum-v1": {
-        "train_steps": 50_000,
+        "train_steps": 30_000,   # smoke-test verified
         "batch_size": 256,
         "lr": 1e-4,
         "gamma": 0.99,
