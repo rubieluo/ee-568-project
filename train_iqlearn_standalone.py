@@ -359,7 +359,6 @@ def train(env_name, K, seed, cfg):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     discrete = cfg["discrete"]
-    pendulum_like = env_is_time_limited_only(env_name)
 
     env = gym.make(env_name)
     obs_dim = env.observation_space.shape[0]
@@ -382,15 +381,14 @@ def train(env_name, K, seed, cfg):
     ds_obs = np.asarray(data["obs"])
     ds_act = np.asarray(data["actions"])
     ds_nob = np.asarray(data["next_obs"])
-    ds_don = np.asarray(data["dones"])
+    # use terminateds (real terminal states only). truncateds were also stored,
+    # but the Bellman bootstrap must NOT be zeroed on time-limit truncation.
+    ds_term = np.asarray(data["terminateds"])
     n = len(ds_obs)
     for i in range(n):
-        # for Pendulum the dataset's "done" is a truncation -> do not mask bootstrap
-        ds_done = float(ds_don[i])
-        done_no_max = 0.0 if pendulum_like else ds_done
         expert_buf.push(
             ds_obs[i], ds_act[i], 0.0,
-            ds_nob[i], done_no_max,
+            ds_nob[i], float(ds_term[i]),
         )
     print(f"  loaded {n} expert transitions into protected expert buffer")
 
@@ -456,11 +454,13 @@ def train(env_name, K, seed, cfg):
 
     env.close()
     final_return = evaluate_policy(agent, env_name, cfg["eval_eps"], discrete)
-    print(f"\nfinal return: {final_return:.1f}")
-    return final_return
+    best_return = max(best_return, final_return)
+    print(f"\nfinal return: {final_return:.1f} | best: {best_return:.1f}")
+    return final_return, best_return
 
 
 def main():
+    global TRACE_CSV  # `append_trace` reads this at call time
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", default="CartPole-v1",
                         choices=["CartPole-v1", "Pendulum-v1"])
@@ -469,7 +469,16 @@ def main():
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--train_steps", type=int, default=None,
                         help="override CONFIG train_steps (useful for smoke tests)")
+    parser.add_argument("--results_csv", default=RESULTS_CSV,
+                        help="path to final-return CSV (default: results/iqlearn_results.csv)")
+    parser.add_argument("--trace_csv", default=TRACE_CSV,
+                        help="path to per-eval trace CSV (default: results/training_trace.csv)")
     args = parser.parse_args()
+
+    TRACE_CSV = args.trace_csv
+    results_csv = args.results_csv
+    os.makedirs(os.path.dirname(results_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(TRACE_CSV) or ".", exist_ok=True)
 
     runs = (
         [(args.env, K, s) for K in [1, 5, 20, 100] for s in [0, 1, 2]]
@@ -478,11 +487,13 @@ def main():
     )
 
     print(f"planned runs: {len(runs)}")
+    print(f"results -> {results_csv}")
+    print(f"trace   -> {TRACE_CSV}")
 
-    fieldnames = ["env", "algo", "K", "seed", "mean_return", "timestamp"]
-    write_header = not os.path.exists(RESULTS_CSV)
+    fieldnames = ["env", "algo", "K", "seed", "mean_return", "best_return", "timestamp"]
+    write_header = not os.path.exists(results_csv)
 
-    with open(RESULTS_CSV, "a", newline="") as f:
+    with open(results_csv, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if write_header:
             writer.writeheader()
@@ -491,15 +502,16 @@ def main():
             cfg = dict(CONFIG[env_name])
             if args.train_steps is not None:
                 cfg["train_steps"] = args.train_steps
-            mean_return = train(env_name, K, seed, cfg)
+            mean_return, best_return = train(env_name, K, seed, cfg)
             writer.writerow(dict(
                 env=env_name, algo="iq_learn", K=K, seed=seed,
                 mean_return=mean_return,
+                best_return=best_return,
                 timestamp=datetime.now().isoformat(),
             ))
             f.flush()
 
-    print(f"\nresults saved to {RESULTS_CSV}")
+    print(f"\nresults saved to {results_csv}")
 
 
 if __name__ == "__main__":
