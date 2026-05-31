@@ -1,12 +1,16 @@
+import argparse
 import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-RESULTS_CSV = "results/all_results.csv"
-FIGURES_DIR = "figures"
-os.makedirs(FIGURES_DIR, exist_ok=True)
+DEFAULT_RESULTS_CSV = "results/all_results.csv"
+DEFAULT_FIGURES_DIR = "figures"
+
+# overridable at runtime via --results-csv / --figures-dir
+RESULTS_CSV = DEFAULT_RESULTS_CSV
+FIGURES_DIR = DEFAULT_FIGURES_DIR
 
 plt.rcParams.update({
     "font.family": "serif",
@@ -123,6 +127,17 @@ def print_summary_table(metric="mean_return"):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--results-csv", default=DEFAULT_RESULTS_CSV,
+                        help=f"path to all_results.csv (default: {DEFAULT_RESULTS_CSV})")
+    parser.add_argument("--figures-dir", default=DEFAULT_FIGURES_DIR,
+                        help=f"output dir for figures (default: {DEFAULT_FIGURES_DIR})")
+    args = parser.parse_args()
+
+    RESULTS_CSV = args.results_csv
+    FIGURES_DIR = args.figures_dir
+    os.makedirs(FIGURES_DIR, exist_ok=True)
+
     make_main_figure(metric="mean_return", filename="combined_mean_return")
     make_per_env_figures(metric="mean_return")
     make_main_figure(metric="best_return", suffix="best return",
@@ -130,4 +145,4 @@ if __name__ == "__main__":
     make_per_env_figures(metric="best_return", suffix="best return")
     print_summary_table(metric="mean_return")
     print_summary_table(metric="best_return")
-    print("\nAll figures saved to figures/")
+    print(f"\nAll figures saved to {FIGURES_DIR}/")

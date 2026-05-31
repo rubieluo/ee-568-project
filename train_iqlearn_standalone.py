@@ -38,7 +38,7 @@ def append_trace(algo, env, K, seed, step, eval_return):
 
 CONFIG = {
     "CartPole-v1": {
-        "train_steps": 30_000,   # smoke-test verified
+        "train_steps": 30_000,   
         "batch_size": 256,
         "lr": 3e-4,
         "gamma": 0.99,
@@ -50,7 +50,7 @@ CONFIG = {
         "tau": 0.005,
     },
     "Pendulum-v1": {
-        "train_steps": 30_000,   # smoke-test verified
+        "train_steps": 30_000,   
         "batch_size": 256,
         "lr": 1e-4,
         "gamma": 0.99,
@@ -376,8 +376,7 @@ def train(env_name, K, seed, cfg):
     policy_buf = ReplayBuffer(capacity=100_000)
 
     data = load_expert_data(env_name, K)
-    # materialize arrays once: NpzFile views re-read from disk on every index,
-    # which silently turned 50k pushes into a 200s loop that the OS killed.
+    # materialize arrays once
     ds_obs = np.asarray(data["obs"])
     ds_act = np.asarray(data["actions"])
     ds_nob = np.asarray(data["next_obs"])

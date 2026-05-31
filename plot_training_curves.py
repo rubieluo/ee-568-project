@@ -4,17 +4,22 @@ Produces one panel per algorithm with one line per K value (colored by K),
 plus a combined figure with all algorithms side by side.
 
 Re-run anytime — even mid-sweep — to see current progress.
+
+Usage:
+    python plot_training_curves.py                # all seeds averaged (±std shaded)
+    python plot_training_curves.py --seed 0       # only seed 0
+    python plot_training_curves.py --seed 0 --seed 2   # average over seeds 0 and 2
 """
 
+import argparse
 import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
-TRACE_CSV   = "results/training_trace.csv"
-FIGURES_DIR = "figures"
-os.makedirs(FIGURES_DIR, exist_ok=True)
+DEFAULT_TRACE_CSV   = "results/training_trace.csv"
+DEFAULT_FIGURES_DIR = "figures"
 
 plt.rcParams.update({
     "font.family": "serif",
@@ -75,35 +80,60 @@ def plot_algo(df, algo, ax, env_name):
     ax.legend(fontsize=8, framealpha=0.6, title="expert size")
 
 
-def make_per_env_figure(df, env_name):
+def make_per_env_figure(df, env_name, figures_dir, tag=""):
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.2), sharey=False)
     for ax, algo in zip(axes, ALGO_ORDER):
         plot_algo(df, algo, ax, env_name)
-    fig.suptitle(f"Training curves – {env_name}", fontsize=12, y=1.02)
+    title = f"Training curves – {env_name}"
+    if tag:
+        title += f" ({tag})"
+    fig.suptitle(title, fontsize=12, y=1.02)
     fig.tight_layout()
     safe = env_name.replace("-", "_")
+    suffix = f"_{tag}" if tag else ""
     for ext in ["png", "pdf"]:
-        out = os.path.join(FIGURES_DIR, f"training_curves_{safe}.{ext}")
+        out = os.path.join(figures_dir, f"training_curves_{safe}{suffix}.{ext}")
         fig.savefig(out, bbox_inches="tight")
         print(f"saved {out}")
     plt.close(fig)
 
 
 def main():
-    if not os.path.exists(TRACE_CSV):
-        print(f"no trace file found at {TRACE_CSV} — run the training sweep first")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--trace", default=DEFAULT_TRACE_CSV,
+                        help=f"path to training_trace.csv (default: {DEFAULT_TRACE_CSV})")
+    parser.add_argument("--figures-dir", default=DEFAULT_FIGURES_DIR,
+                        help=f"output dir for figures (default: {DEFAULT_FIGURES_DIR})")
+    parser.add_argument("--seed", type=int, action="append", default=None,
+                        help="only include this seed (repeatable, e.g. --seed 0 --seed 2). omit for all seeds.")
+    args = parser.parse_args()
+
+    os.makedirs(args.figures_dir, exist_ok=True)
+
+    if not os.path.exists(args.trace):
+        print(f"no trace file found at {args.trace} — run the training sweep first")
         return
-    df = pd.read_csv(TRACE_CSV)
+    df = pd.read_csv(args.trace)
     if df.empty:
         print("trace file is empty (training may not have produced an eval yet)")
         return
 
+    tag = ""
+    if args.seed is not None:
+        df = df[df["seed"].isin(args.seed)]
+        if df.empty:
+            avail = sorted(pd.read_csv(args.trace)['seed'].unique().tolist())
+            print(f"no rows match seed(s) {args.seed} — available: {avail}")
+            return
+        tag = "seed" + "_".join(str(s) for s in args.seed)
+
     envs = sorted(df["env"].unique().tolist())
-    print(f"trace contains {len(df)} rows across envs {envs}")
+    print(f"trace contains {len(df)} rows across envs {envs}"
+          + (f" (filtered to seed(s) {args.seed})" if args.seed is not None else ""))
     print(df.groupby(["env", "algo", "K"]).size().rename("evals"))
 
     for env_name in envs:
-        make_per_env_figure(df, env_name)
+        make_per_env_figure(df, env_name, args.figures_dir, tag=tag)
 
 
 if __name__ == "__main__":

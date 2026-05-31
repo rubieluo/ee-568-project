@@ -26,14 +26,16 @@ def collect_trajectories(env_name: str, K: int, seed: int = 0):
     model = load_expert(env_name)
     env = gym.make(env_name)
 
-    all_obs, all_actions, all_next_obs, all_dones, all_rewards = [], [], [], [], []
+    all_obs, all_actions, all_next_obs = [], [], []
+    all_terminateds, all_truncateds, all_rewards = [], [], []
     traj_returns = []
 
     for ep in range(K):
         obs, _ = env.reset(seed=seed + ep)
         done = False
         ep_return = 0.0
-        ep_obs, ep_acts, ep_next_obs, ep_dones, ep_rews = [], [], [], [], []
+        ep_obs, ep_acts, ep_next_obs = [], [], []
+        ep_terms, ep_truncs, ep_rews = [], [], []
 
         while not done:
             action, _ = model.predict(obs, deterministic=True)
@@ -43,7 +45,8 @@ def collect_trajectories(env_name: str, K: int, seed: int = 0):
             ep_obs.append(obs)
             ep_acts.append(action)
             ep_next_obs.append(next_obs)
-            ep_dones.append(float(done))
+            ep_terms.append(float(terminated))   # real terminal state (e.g. pole fell)
+            ep_truncs.append(float(truncated))   # time-limit cutoff — should NOT zero the Bellman bootstrap
             ep_rews.append(reward)
             ep_return += reward
             obs = next_obs
@@ -51,7 +54,8 @@ def collect_trajectories(env_name: str, K: int, seed: int = 0):
         all_obs.extend(ep_obs)
         all_actions.extend(ep_acts)
         all_next_obs.extend(ep_next_obs)
-        all_dones.extend(ep_dones)
+        all_terminateds.extend(ep_terms)
+        all_truncateds.extend(ep_truncs)
         all_rewards.extend(ep_rews)
         traj_returns.append(ep_return)
         print(f"  Traj {ep+1}/{K}  return={ep_return:.1f}")
@@ -64,7 +68,8 @@ def collect_trajectories(env_name: str, K: int, seed: int = 0):
         obs=np.array(all_obs),
         actions=np.array(all_actions),
         next_obs=np.array(all_next_obs),
-        dones=np.array(all_dones),
+        terminateds=np.array(all_terminateds),
+        truncateds=np.array(all_truncateds),
         rewards=np.array(all_rewards),
     )
     print(f"Saved {len(all_obs)} transitions to {save_path}\n")
